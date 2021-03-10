@@ -1,41 +1,175 @@
 #!/bin/bash
-cd /opt/valheim
-valheim_server="/opt/valheim/valheim_server.x86_64"
-valheim_server_pid=-1
-SERVER_NAME=${SERVER_NAME:-My Server}
-SERVER_PORT=${SERVER_PORT:-2456}
-WORLD_NAME=${WORLD_NAME:-Dedicated}
-SERVER_PASS=${SERVER_PASS:-secret}
-SERVER_PUBLIC=${SERVER_PUBLIC:-1}
-timeout=20
-kill_signal=TERM
+# valheim-server starts the Valheim server
+# binary either vanilla from /opt/valheim/server
+# or if VALHEIM_PLUS=true with the ValheimPlus mod
+# from /opt/valheim/plus
+
+# Include defaults and common functions
+. /usr/local/etc/valheim/defaults
+. /usr/local/etc/valheim/common
 
 export SteamAppId=892970
-export LD_LIBRARY_PATH="/opt/valheim/linux64/"
+
+valheim_server_pid=-1
+timeout=29
+kill_signal=TERM
+password_args=(-password "$SERVER_PASS")
+
+if [ "$VALHEIM_PLUS" = true ]; then
+    cd "$vp_install_path" || fatal "Could not cd $vp_install_path"
+    rm -rf "$vp_install_path.old"
+    export DOORSTOP_ENABLE=TRUE
+    export DOORSTOP_INVOKE_DLL_PATH="./BepInEx/core/BepInEx.Preloader.dll"
+    export DOORSTOP_CORLIB_OVERRIDE_PATH="./unstripped_corlib"
+    export LD_LIBRARY_PATH="$vp_install_path/linux64/:$vp_install_path/doorstop_libs/"
+    SERVER_LD_PRELOAD=libdoorstop_x64.so
+    valheim_server="$vp_install_path/valheim_server.x86_64"
+    [ -z "$SERVER_PASS" ] && password_args=()
+else
+    cd "$valheim_install_path" || fatal "Could not cd $valheim_install_path"
+    export LD_LIBRARY_PATH="$valheim_install_path/linux64/"
+    SERVER_LD_PRELOAD=""
+    valheim_server="$valheim_install_path/valheim_server.x86_64"
+fi
+
 
 main() {
+    wait_for_server_download
+    run_server
+}
+
+
+wait_for_server_download() {
     while :; do
         if [ -f "$valheim_server" ]; then
             break
         else
-            echo "Valheim Server is not yet downloaded - waiting"
-            sleep 10
+            debug "Valheim Server is not yet downloaded - waiting"
+            sleep 7
         fi
     done
-    echo "Running Valheim Server"
-    "$valheim_server" -nographics -batchmode -name "$SERVER_NAME" -port $SERVER_PORT -world "$WORLD_NAME" -password "$SERVER_PASS" -public $SERVER_PUBLIC &
-    valheim_server_pid=$!
-    wait
 }
 
+
+# This runs after server start and waits for the
+# config files to either exist or for the server
+# to create them so their access permissions can
+# be adjusted to the proper values.
+ensure_permissions_after_start() {
+    while :; do
+        if [ -f "/config/adminlist.txt" ]; then
+            ensure_permissions
+            break
+        else
+            sleep 4
+        fi
+    done
+}
+
+
+wait_for_server_listening() {
+    while :; do
+        if server_is_listening; then
+            update_server_status running
+            break
+        else
+            debug "Waiting for server to listen on port $SERVER_PORT"
+            sleep 5
+        fi
+    done
+}
+
+
+run_server() {
+    pre_server_run_hook
+    info "Running Valheim Server"
+    update_server_status starting
+
+    # shellcheck disable=SC2086
+    LD_PRELOAD=$SERVER_LD_PRELOAD "$valheim_server" -nographics -batchmode -name "$SERVER_NAME" -port "$SERVER_PORT" -world "$WORLD_NAME" -public "$SERVER_PUBLIC" "${password_args[@]}" $SERVER_ARGS > >(filter stdout)  2> >(filter stderr >&2) &
+    valheim_server_pid=$!
+    unset LD_LIBRARY_PATH
+    unset LD_PRELOAD
+    echo $valheim_server_pid > "$valheim_server_pidfile"
+
+    ensure_permissions_after_start &
+    permissions_wait_pid=$!
+    wait_for_server_listening &
+    wait_for_server_listening_pid=$!
+
+    wait $valheim_server_pid
+    debug "Valheim server with PID $valheim_server_pid stopped"
+    update_server_status stopped
+    post_server_run_hook
+
+    cleanup
+    post_server_shutdown_hook
+    info "Shutdown complete"
+    exit 0
+}
+
+
+cleanup() {
+    if [ -n "${permissions_wait_pid:-}" ] && [ -d "/proc/$permissions_wait_pid" ]; then
+        kill -TERM $permissions_wait_pid
+    fi
+    if [ -n "${wait_for_server_listening_pid:-}" ] && [ -d "/proc/$wait_for_server_listening_pid" ]; then
+        kill -TERM $wait_for_server_listening_pid
+    fi
+    clear_lock "$valheim_server_pidfile"
+}
+
+
+# This function gets the servers stdout/stderr
+# output piped into. It allows for filtering
+# of unwanted debug log messages.
+filter() {
+    unset LD_LIBRARY_PATH
+    unset LD_PRELOAD
+    case $1 in
+        stdout)
+            log_filter=$SERVER_LOG_STDOUT_FILTER
+            ;;
+        stderr)
+            log_filter=$SERVER_LOG_STDERR_FILTER
+            ;;
+    esac
+    eval "$log_filter"
+}
+
+
+pre_server_run_hook() {
+    if [ -n "$PRE_SERVER_RUN_HOOK" ]; then
+        info "Running pre server run hook: $PRE_SERVER_RUN_HOOK"
+        eval "$PRE_SERVER_RUN_HOOK"
+    fi
+}
+
+
+post_server_run_hook() {
+    if [ -n "$POST_SERVER_RUN_HOOK" ]; then
+        info "Running post server run hook: $POST_SERVER_RUN_HOOK"
+        eval "$POST_SERVER_RUN_HOOK"
+    fi
+}
+
+
 shutdown() {
-    echo "Shutting down Valheim Server with PID $valheim_server_pid"
+    debug "Received signal to shut down valheim-server"
+    update_server_status stopping
+    if [ $valheim_server_pid -eq -1 ]; then
+        debug "Valheim server is not running yet - aborting startup"
+        update_server_status stopped
+        exit
+    fi
+    pre_server_shutdown_hook
+    info "Shutting down Valheim server with PID $valheim_server_pid"
     kill -INT $valheim_server_pid
-    shutdown_timeout=$(($(date +%s)+$timeout))
+    shutdown_timeout=$(($(date +%s)+timeout))
     while [ -d "/proc/$valheim_server_pid" ]; do
-        if [ $(date +%s) -gt $shutdown_timeout ]; then
-            shutdown_timeout=$(($(date +%s)+$timeout))
-            echo "Timeout while waiting for server to shutdown - sending SIG$kill_signal to PID $valheim_server_pid"
+        if [ "$(date +%s)" -gt $shutdown_timeout ]; then
+            shutdown_timeout=$(($(date +%s)+timeout))
+            warn "Timeout while waiting for server to shut down - sending SIG$kill_signal to PID $valheim_server_pid"
             kill -$kill_signal $valheim_server_pid
             case "$kill_signal" in
                 INT)
@@ -45,12 +179,27 @@ shutdown() {
                     kill_signal=KILL
             esac
         fi
-        echo "Waiting for Valheim Server with PID $valheim_server_pid to shutdown"
-        sleep 3
+        debug "Waiting for Valheim Server with PID $valheim_server_pid to shut down"
+        sleep 6
     done
-    echo "Shutdown complete"
-    exit
 }
+
+
+pre_server_shutdown_hook() {
+    if [ -n "$PRE_SERVER_SHUTDOWN_HOOK" ]; then
+        info "Running pre server shutdown hook: $PRE_SERVER_SHUTDOWN_HOOK"
+        eval "$PRE_SERVER_SHUTDOWN_HOOK"
+    fi
+}
+
+
+post_server_shutdown_hook() {
+    if [ -n "$POST_SERVER_SHUTDOWN_HOOK" ]; then
+        info "Running post server shutdown hook: $POST_SERVER_SHUTDOWN_HOOK"
+        eval "$POST_SERVER_SHUTDOWN_HOOK"
+    fi
+}
+
 
 trap shutdown SIGINT SIGTERM
 main

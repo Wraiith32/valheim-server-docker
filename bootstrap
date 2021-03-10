@@ -1,0 +1,96 @@
+#!/bin/bash
+# Bootstraps supervisor config
+
+# Include defaults
+. /usr/local/etc/valheim/defaults
+. /usr/local/etc/valheim/common
+
+
+main() {
+    configure_timezone
+    setup_supervisor_http_server
+    setup_status_http_server
+    exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+}
+
+
+# Configure timezone
+configure_timezone() {
+    export TZ
+    if [ ! -f "/usr/share/zoneinfo/$TZ" ]; then
+        warn "Unknown timezone $TZ - defaulting to Etc/UTC"
+        TZ="Etc/UTC"
+    fi
+    ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
+    echo "$TZ" > /etc/timezone
+    info "Setting timezone $TZ"
+}
+
+
+# Enable/disable supervisor http server
+setup_supervisor_http_server() {
+    rm -f "$supervisor_http_server_conf"
+    if [ "$SUPERVISOR_HTTP" = true ]; then
+        if [ -n "$SUPERVISOR_HTTP_PASS" ]; then
+            cat > "$supervisor_http_server_conf" <<EOF
+[inet_http_server]
+port = :9001
+username = $SUPERVISOR_HTTP_USER
+password = $SUPERVISOR_HTTP_PASS
+EOF
+            chmod 600 "$supervisor_http_server_conf"
+        else
+            error "SUPERVISOR_HTTP enabled but SUPERVISOR_HTTP_PASS is empty - ignoring request to run supervisor http server"
+        fi
+    fi
+}
+
+
+# Enable/disable status http server
+setup_status_http_server() {
+    rm -f "$status_http_server_conf"
+    rm -f "$status_http_server_updater_conf"
+    if [ "$STATUS_HTTP" = true ]; then
+        info "Status http server activated"
+        touch "$STATUS_HTTP_CONF"
+        mkdir -p "$STATUS_HTTP_HTDOCS"
+        if [ ! -d "$STATUS_HTTP_HTDOCS" ]; then
+            error "Could not create directory $STATUS_HTTP_HTDOCS"
+            return
+        fi
+        cat > "$status_http_server_conf" <<EOF
+[program:valheim-status-httpd]
+user=root
+environment=HOME="/root",USER="root",LANG="en_US.UTF-8",PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+command=/usr/local/bin/httpd -f -p "$STATUS_HTTP_PORT" -h "$STATUS_HTTP_HTDOCS" -c "$STATUS_HTTP_CONF"
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+autostart=true
+autorestart=true
+startsecs=10
+startretries=0
+priority=90
+EOF
+        cat > "$status_http_server_updater_conf" <<EOF
+[program:valheim-status-updater]
+user=root
+environment=HOME="/root",USER="root",LANG="en_US.UTF-8",PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+command=/usr/local/bin/valheim-status --update
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+autostart=true
+autorestart=true
+startsecs=10
+startretries=0
+priority=80
+EOF
+        chmod 600 "$status_http_server_updater_conf"
+    fi
+}
+
+
+main
